@@ -56,14 +56,25 @@ class AmazonScraper:
         """Clean price text to extract numeric value"""
         if not price_text:
             return None
-        # Remove currency symbols and extra whitespace
-        price = re.sub(r'[^\d.,]', '', price_text.strip())
-        # Handle cases like "1,234.56"
+        
+        # Handle full price spans with decimal and fraction parts
+        if isinstance(price_text, str):
+            # Look for price patterns like $89.95, 89.95, etc.
+            price_match = re.search(r'[\$]?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)', price_text)
+            if price_match:
+                price_str = price_match.group(1).replace(',', '')
+                try:
+                    return float(price_str)
+                except:
+                    return price_str
+        
+        # Fallback: remove currency symbols and extra whitespace
+        price = re.sub(r'[^\d.,]', '', str(price_text).strip())
         price = price.replace(',', '')
         try:
             return float(price)
         except:
-            return price_text.strip()
+            return price_text.strip() if price_text else None
     
     def extract_buybox_info(self, soup):
         """Extract buy box information"""
@@ -74,121 +85,226 @@ class AmazonScraper:
             'buybox_sold_by': None
         }
         
-        # Try to find price in buy box
-        price_selectors = [
-            '.a-price.a-text-price.a-size-medium.a-color-base .a-price-whole',
-            '.a-price-whole',
-            '#apex_desktop .a-price .a-price-whole',
-            '#priceblock_dealprice',
-            '#priceblock_pospromoprice'
-        ]
+        # Enhanced price extraction - look for complete price structure
+        price_found = False
         
-        for selector in price_selectors:
-            price_elem = soup.select_one(selector)
-            if price_elem:
-                buybox_data['buybox_price'] = self.clean_price(price_elem.get_text())
-                break
+        # Method 1: Look for complete price spans with decimal/fraction
+        price_containers = soup.find_all('span', class_='a-price')
+        for container in price_containers:
+            if not price_found:
+                # Look for whole + decimal + fraction structure
+                whole_elem = container.find('span', class_='a-price-whole')
+                fraction_elem = container.find('span', class_='a-price-fraction')
+                
+                if whole_elem:
+                    whole_price = whole_elem.get_text().strip()
+                    if fraction_elem:
+                        fraction_price = fraction_elem.get_text().strip()
+                        full_price = f"{whole_price}.{fraction_price}"
+                    else:
+                        full_price = whole_price
+                    
+                    buybox_data['buybox_price'] = self.clean_price(full_price)
+                    price_found = True
+                    break
         
-        # Try to find seller information
+        # Method 2: Fallback price selectors
+        if not price_found:
+            price_selectors = [
+                '.a-price-whole',
+                '#apex_desktop .a-price .a-price-whole',
+                '#priceblock_dealprice',
+                '#priceblock_pospromoprice',
+                '.a-price .a-offscreen',
+                '#priceDisplayInfoFeature .a-price .a-offscreen'
+            ]
+            
+            for selector in price_selectors:
+                price_elem = soup.select_one(selector)
+                if price_elem:
+                    buybox_data['buybox_price'] = self.clean_price(price_elem.get_text())
+                    price_found = True
+                    break
+        
+        # Enhanced seller information extraction
         seller_selectors = [
             '#merchantInfoFeature_feature_div a',
             '#sellerProfileTriggerId',
-            '#merchant-info a'
+            '#merchant-info a',
+            'a[href*="seller="]',
+            '.tabular-buybox-text[data-feature-name="bylineInfo"] a'
         ]
         
         for selector in seller_selectors:
             seller_elem = soup.select_one(selector)
             if seller_elem:
-                buybox_data['buybox_seller'] = seller_elem.get_text().strip()
+                seller_text = seller_elem.get_text().strip()
+                # Clean seller name
+                seller_text = re.sub(r'^(by\s+|sold\s+by\s+)', '', seller_text, flags=re.IGNORECASE)
+                buybox_data['buybox_seller'] = seller_text
                 break
         
-        # Ships from and sold by info
-        fulfillment_elem = soup.select_one('#merchantInfoFeature_feature_div')
-        if fulfillment_elem:
-            text = fulfillment_elem.get_text()
-            if 'Ships from' in text:
-                ships_match = re.search(r'Ships from\s+([^.]+)', text)
-                if ships_match:
-                    buybox_data['buybox_ships_from'] = ships_match.group(1).strip()
-            
-            if 'Sold by' in text:
-                sold_match = re.search(r'Sold by\s+([^.]+)', text)
-                if sold_match:
-                    buybox_data['buybox_sold_by'] = sold_match.group(1).strip()
+        # Enhanced fulfillment info extraction
+        fulfillment_containers = [
+            '#merchantInfoFeature_feature_div',
+            '#tabular-buybox',
+            '.tabular-buybox-text',
+            '#merchant-info'
+        ]
+        
+        for container_selector in fulfillment_containers:
+            fulfillment_elem = soup.select_one(container_selector)
+            if fulfillment_elem:
+                text = fulfillment_elem.get_text()
+                
+                # Ships from
+                ships_patterns = [
+                    r'Ships from\s+([^.\n]+)',
+                    r'Shipped from\s+([^.\n]+)',
+                    r'Ships from:\s*([^.\n]+)'
+                ]
+                for pattern in ships_patterns:
+                    ships_match = re.search(pattern, text, re.IGNORECASE)
+                    if ships_match and not buybox_data['buybox_ships_from']:
+                        buybox_data['buybox_ships_from'] = ships_match.group(1).strip()
+                        break
+                
+                # Sold by
+                sold_patterns = [
+                    r'Sold by\s+([^.\n]+)',
+                    r'Sold by:\s*([^.\n]+)'
+                ]
+                for pattern in sold_patterns:
+                    sold_match = re.search(pattern, text, re.IGNORECASE)
+                    if sold_match and not buybox_data['buybox_sold_by']:
+                        buybox_data['buybox_sold_by'] = sold_match.group(1).strip()
+                        break
+                
+                if buybox_data['buybox_ships_from'] and buybox_data['buybox_sold_by']:
+                    break
         
         return buybox_data
     
     def extract_other_sellers(self, soup, asin):
-        """Extract other sellers information"""
+        """Extract other sellers information by following the offer-listing page"""
         sellers_data = []
         
-        # Look for "Other Sellers on Amazon" section
-        other_sellers_section = soup.find('div', {'id': 'olp-upd-new-used-carousel'}) or \
-                               soup.find('div', {'data-feature-name': 'olp-carousel'}) or \
-                               soup.find('div', string=re.compile('Other Sellers on Amazon', re.I))
+        # First, look for the "Other Sellers on Amazon" link
+        offer_link = None
         
-        if other_sellers_section:
-            # Find seller containers
-            seller_containers = other_sellers_section.find_all('div', class_=re.compile('olp-card|offer-listing'))
+        # Look for the link that leads to offer-listing page
+        offer_selectors = [
+            'a[href*="offer-listing"]',
+            'a[href*="/gp/offer-listing/"]',
+            '#aod-ingress-link',
+            'a[id="aod-ingress-link"]'
+        ]
+        
+        for selector in offer_selectors:
+            link_elem = soup.select_one(selector)
+            if link_elem and link_elem.get('href'):
+                offer_link = link_elem.get('href')
+                if offer_link.startswith('/'):
+                    offer_link = 'https://www.amazon.com' + offer_link
+                break
+        
+        # If no direct link found, construct the offers URL
+        if not offer_link:
+            offer_link = f"https://www.amazon.com/gp/offer-listing/{asin}/ref=dp_olp_ALL_mbc?ie=UTF8&condition=ALL"
+        
+        st.info(f"Fetching additional sellers from: {offer_link}")
+        
+        try:
+            # Fetch the offers page
+            time.sleep(random.uniform(1, 2))  # Be respectful
+            offers_soup, _ = self.get_page_direct(offer_link)
             
-            for container in seller_containers:
-                seller_data = {}
+            if offers_soup:
+                # Look for offer listings on the offers page
+                offer_containers = offers_soup.find_all('div', {'class': re.compile(r'a-row.*olp-offer')}) or \
+                                  offers_soup.find_all('div', {'data-aod-atc-action': True}) or \
+                                  offers_soup.find_all('div', class_='olp-offer-row')
                 
-                # Price
-                price_elem = container.find('span', class_=re.compile('a-price-whole|price'))
-                if price_elem:
-                    seller_data['price'] = self.clean_price(price_elem.get_text())
+                st.info(f"Found {len(offer_containers)} offer containers")
                 
-                # Seller name
-                seller_elem = container.find('a', href=re.compile('seller=')) or \
-                             container.find('span', string=re.compile('by '))
-                if seller_elem:
-                    seller_data['seller_name'] = seller_elem.get_text().strip()
-                
-                # Condition
-                condition_elem = container.find('span', string=re.compile('New|Used|Refurbished', re.I))
-                if condition_elem:
-                    seller_data['condition'] = condition_elem.get_text().strip()
-                
-                # Shipping info
-                shipping_elem = container.find('span', string=re.compile('shipping|delivery', re.I))
-                if shipping_elem:
-                    seller_data['shipping'] = shipping_elem.get_text().strip()
-                
-                if seller_data:  # Only add if we found some data
-                    sellers_data.append(seller_data)
-        
-        # If no sellers found in carousel, try the "See All Buying Options" approach
-        if not sellers_data:
-            # This might require a separate request to the offers page
-            offers_url = f"https://www.amazon.com/gp/offer-listing/{asin}/"
-            try:
-                offers_soup, _ = self.get_page_direct(offers_url)
-                if offers_soup:
-                    offer_rows = offers_soup.find_all('div', class_=re.compile('olp-offer'))
-                    for row in offer_rows:
-                        seller_data = {}
+                for i, container in enumerate(offer_containers[:10]):  # Limit to first 10 sellers
+                    seller_data = {}
+                    
+                    # Extract price - look for various price structures
+                    price_elem = container.find('span', class_='a-price-whole')
+                    if not price_elem:
+                        price_elem = container.find('span', class_='a-price')
+                    
+                    if price_elem:
+                        # Look for complete price structure
+                        whole_elem = price_elem.find('span', class_='a-price-whole') or price_elem
+                        fraction_elem = container.find('span', class_='a-price-fraction')
                         
-                        # Price
-                        price_elem = row.find('span', class_='a-price-whole')
-                        if price_elem:
-                            seller_data['price'] = self.clean_price(price_elem.get_text())
-                        
-                        # Seller
-                        seller_elem = row.find('a', href=re.compile('seller='))
-                        if seller_elem:
-                            seller_data['seller_name'] = seller_elem.get_text().strip()
-                        
-                        # Condition
-                        condition_elem = row.find('span', class_='olp-condition-text')
-                        if condition_elem:
-                            seller_data['condition'] = condition_elem.get_text().strip()
-                        
-                        if seller_data:
-                            sellers_data.append(seller_data)
+                        if whole_elem:
+                            whole_text = whole_elem.get_text().strip()
+                            if fraction_elem:
+                                fraction_text = fraction_elem.get_text().strip()
+                                full_price = f"{whole_text}.{fraction_text}"
+                            else:
+                                full_price = whole_text
                             
-            except Exception as e:
-                st.warning(f"Could not fetch additional seller data for {asin}: {str(e)}")
+                            seller_data['price'] = self.clean_price(full_price)
+                    
+                    # Extract seller name
+                    seller_selectors = [
+                        'a[aria-label*="seller profile"]',
+                        'a[href*="seller="]',
+                        '.olp-seller-name a',
+                        'span[aria-label*="seller"]'
+                    ]
+                    
+                    for sel in seller_selectors:
+                        seller_elem = container.find('a', href=re.compile(r'seller=')) or \
+                                     container.select_one(sel)
+                        if seller_elem:
+                            seller_name = seller_elem.get_text().strip()
+                            # Clean up seller name
+                            seller_name = re.sub(r'^(by\s+)', '', seller_name, flags=re.IGNORECASE)
+                            seller_data['seller_name'] = seller_name
+                            break
+                    
+                    # Extract condition
+                    condition_elem = container.find('span', class_='a-size-base') or \
+                                    container.find('span', string=re.compile(r'New|Used|Refurbished|Collectible', re.I))
+                    
+                    if condition_elem:
+                        condition_text = condition_elem.get_text().strip()
+                        # Extract just the condition part
+                        for cond in ['New', 'Used', 'Refurbished', 'Collectible']:
+                            if cond.lower() in condition_text.lower():
+                                seller_data['condition'] = cond
+                                break
+                    
+                    # Extract shipping information
+                    shipping_elem = container.find('span', string=re.compile(r'shipping|delivery|FREE', re.I))
+                    if shipping_elem:
+                        seller_data['shipping'] = shipping_elem.get_text().strip()
+                    
+                    # Ships from / Sold by information
+                    fulfillment_text = container.get_text()
+                    
+                    # Ships from
+                    ships_match = re.search(r'Ships from\s+([^.\n]+)', fulfillment_text, re.IGNORECASE)
+                    if ships_match:
+                        seller_data['ships_from'] = ships_match.group(1).strip()
+                    
+                    # Sold by
+                    sold_match = re.search(r'Sold by\s+([^.\n]+)', fulfillment_text, re.IGNORECASE)
+                    if sold_match:
+                        seller_data['sold_by'] = sold_match.group(1).strip()
+                    
+                    # Only add if we found meaningful data
+                    if seller_data.get('price') or seller_data.get('seller_name'):
+                        sellers_data.append(seller_data)
+                        st.success(f"Extracted seller {i+1}: {seller_data.get('seller_name', 'Unknown')} - ${seller_data.get('price', 'N/A')}")
+                
+        except Exception as e:
+            st.warning(f"Could not fetch additional seller data for {asin}: {str(e)}")
         
         return sellers_data
     
@@ -226,18 +342,40 @@ class AmazonScraper:
                 'seller_name': None,
                 'seller_price': None,
                 'seller_condition': None,
-                'seller_shipping': None
+                'seller_shipping': None,
+                'seller_ships_from': None,
+                'seller_sold_by': None
             }]
         
-        # Extract title
-        title_elem = soup.find('span', {'id': 'productTitle'}) or soup.find('h1')
-        title = title_elem.get_text().strip() if title_elem else 'Title not found'
+        # Enhanced title extraction
+        title = None
+        title_selectors = [
+            'span#productTitle',
+            '#productTitle',
+            'h1.a-size-large',
+            'h1 span',
+            'h1',
+            '.product-title',
+            '[data-automation-id="product-title"]'
+        ]
+        
+        for selector in title_selectors:
+            title_elem = soup.select_one(selector)
+            if title_elem:
+                title = title_elem.get_text().strip()
+                if title:  # Make sure it's not empty
+                    break
+        
+        if not title:
+            title = 'Title not found'
         
         # Check if product is available
         unavailable_indicators = [
             'Currently unavailable',
             'This item is not available',
-            'Page Not Found'
+            'Page Not Found',
+            'Sorry, we just ran out',
+            'Out of stock'
         ]
         
         page_text = soup.get_text()
@@ -259,7 +397,13 @@ class AmazonScraper:
             'URL': url,
             'Status': 'Available' if is_available else 'Unavailable',
             **buybox_data,
-            'seller_type': 'buybox'
+            'seller_type': 'buybox',
+            'seller_name': buybox_data.get('buybox_seller'),
+            'seller_price': buybox_data.get('buybox_price'),
+            'seller_condition': 'New',  # Buy box is typically new
+            'seller_shipping': None,
+            'seller_ships_from': buybox_data.get('buybox_ships_from'),
+            'seller_sold_by': buybox_data.get('buybox_sold_by')
         }
         results.append(base_data)
         
@@ -270,8 +414,10 @@ class AmazonScraper:
                 'seller_type': f'other_seller_{i+1}',
                 'seller_name': seller.get('seller_name'),
                 'seller_price': seller.get('price'),
-                'seller_condition': seller.get('condition'),
-                'seller_shipping': seller.get('shipping')
+                'seller_condition': seller.get('condition', 'Unknown'),
+                'seller_shipping': seller.get('shipping'),
+                'seller_ships_from': seller.get('ships_from'),
+                'seller_sold_by': seller.get('sold_by')
             })
             results.append(seller_row)
         
