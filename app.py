@@ -57,24 +57,38 @@ class AmazonScraper:
         if not price_text:
             return None
         
-        # Handle full price spans with decimal and fraction parts
-        if isinstance(price_text, str):
-            # Look for price patterns like $89.95, 89.95, etc.
-            price_match = re.search(r'[\$]?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)', price_text)
-            if price_match:
-                price_str = price_match.group(1).replace(',', '')
-                try:
-                    return float(price_str)
-                except:
-                    return price_str
+        # Convert to string if not already
+        price_str = str(price_text).strip()
         
-        # Fallback: remove currency symbols and extra whitespace
-        price = re.sub(r'[^\d.,]', '', str(price_text).strip())
-        price = price.replace(',', '')
-        try:
-            return float(price)
-        except:
-            return price_text.strip() if price_text else None
+        # Method 1: Look for standard price patterns like $89.95, 89.95, etc.
+        price_patterns = [
+            r'\$?(\d{1,3}(?:,\d{3})*\.\d{2})',  # $1,234.56 or 1,234.56
+            r'\$?(\d{1,3}(?:,\d{3})*)',         # $1,234 or 1,234 (whole numbers)
+        ]
+        
+        for pattern in price_patterns:
+            match = re.search(pattern, price_str)
+            if match:
+                clean_price = match.group(1).replace(',', '')
+                try:
+                    return float(clean_price)
+                except:
+                    continue
+        
+        # Method 2: If no standard pattern found, try to extract all digits and decimal
+        digits_decimal = re.findall(r'\d+\.?\d*', price_str)
+        if digits_decimal:
+            try:
+                # Take the first occurrence that looks like a price
+                for candidate in digits_decimal:
+                    if '.' in candidate and len(candidate.split('.')[1]) == 2:
+                        return float(candidate)
+                    elif '.' not in candidate and len(candidate) <= 6:  # Reasonable price length
+                        return float(candidate)
+            except:
+                pass
+        
+        return price_str if price_str else None
     
     def extract_buybox_info(self, soup):
         """Extract buy box information"""
@@ -220,91 +234,161 @@ class AmazonScraper:
             offers_soup, _ = self.get_page_direct(offer_link)
             
             if offers_soup:
-                # Look for offer listings on the offers page
-                offer_containers = offers_soup.find_all('div', {'class': re.compile(r'a-row.*olp-offer')}) or \
-                                  offers_soup.find_all('div', {'data-aod-atc-action': True}) or \
-                                  offers_soup.find_all('div', class_='olp-offer-row')
+                # Multiple selectors for finding offer containers
+                offer_containers = []
                 
-                st.info(f"Found {len(offer_containers)} offer containers")
+                # Try different container selectors
+                container_selectors = [
+                    'div[data-aod-atc-action]',  # Modern Amazon structure
+                    'div.a-row.a-spacing-mini.olp-offer-row',  # Traditional structure
+                    'div.olp-offer-row',
+                    'div[class*="olp-offer"]',
+                    'div.a-section.a-spacing-small.olp-offer'
+                ]
                 
-                for i, container in enumerate(offer_containers[:10]):  # Limit to first 10 sellers
-                    seller_data = {}
+                for selector in container_selectors:
+                    containers = offers_soup.select(selector)
+                    if containers:
+                        offer_containers = containers
+                        st.info(f"Found {len(containers)} sellers using selector: {selector}")
+                        break
+                
+                # If still no containers, try broader search
+                if not offer_containers:
+                    # Look for any divs that contain price information
+                    all_divs = offers_soup.find_all('div')
+                    for div in all_divs:
+                        if div.find('span', class_='a-price') or div.find('span', string=re.compile(r'\$\d+')):
+                            offer_containers.append(div)
                     
-                    # Extract price - look for various price structures
-                    price_elem = container.find('span', class_='a-price-whole')
-                    if not price_elem:
-                        price_elem = container.find('span', class_='a-price')
-                    
-                    if price_elem:
-                        # Look for complete price structure
-                        whole_elem = price_elem.find('span', class_='a-price-whole') or price_elem
-                        fraction_elem = container.find('span', class_='a-price-fraction')
+                    if offer_containers:
+                        st.info(f"Found {len(offer_containers)} potential seller containers through broad search")
+                
+                # Process each seller container
+                for i, container in enumerate(offer_containers):
+                    if i >= 20:  # Limit to first 20 sellers to avoid excessive processing
+                        break
                         
-                        if whole_elem:
-                            whole_text = whole_elem.get_text().strip()
-                            if fraction_elem:
-                                fraction_text = fraction_elem.get_text().strip()
-                                full_price = f"{whole_text}.{fraction_text}"
-                            else:
-                                full_price = whole_text
+                    seller_data = {}
+                    container_text = container.get_text()
+                    
+                    # Extract price with enhanced methods
+                    price_found = False
+                    
+                    # Method 1: Look for a-offscreen price (most reliable)
+                    offscreen_price = container.find('span', class_='a-offscreen')
+                    if offscreen_price:
+                        price_text = offscreen_price.get_text().strip()
+                        cleaned_price = self.clean_price(price_text)
+                        if cleaned_price:
+                            seller_data['price'] = cleaned_price
+                            price_found = True
+                    
+                    # Method 2: Construct from price parts
+                    if not price_found:
+                        price_container = container.find('span', class_='a-price')
+                        if price_container:
+                            whole_elem = price_container.find('span', class_='a-price-whole')
+                            fraction_elem = price_container.find('span', class_='a-price-fraction')
+                            decimal_elem = price_container.find('span', class_='a-price-decimal')
                             
-                            seller_data['price'] = self.clean_price(full_price)
+                            if whole_elem:
+                                whole_text = whole_elem.get_text().strip().replace(',', '')
+                                if fraction_elem:
+                                    fraction_text = fraction_elem.get_text().strip()
+                                    if decimal_elem:
+                                        decimal_text = decimal_elem.get_text().strip()
+                                        full_price = f"{whole_text}{decimal_text}{fraction_text}"
+                                    else:
+                                        full_price = f"{whole_text}.{fraction_text}"
+                                else:
+                                    full_price = whole_text
+                                
+                                cleaned_price = self.clean_price(full_price)
+                                if cleaned_price:
+                                    seller_data['price'] = cleaned_price
+                                    price_found = True
                     
-                    # Extract seller name
-                    seller_selectors = [
-                        'a[aria-label*="seller profile"]',
-                        'a[href*="seller="]',
-                        '.olp-seller-name a',
-                        'span[aria-label*="seller"]'
-                    ]
+                    # Method 3: Regex fallback for price
+                    if not price_found:
+                        price_matches = re.findall(r'\$(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)', container_text)
+                        if price_matches:
+                            seller_data['price'] = self.clean_price(price_matches[0])
+                            price_found = True
                     
-                    for sel in seller_selectors:
-                        seller_elem = container.find('a', href=re.compile(r'seller=')) or \
-                                     container.select_one(sel)
-                        if seller_elem:
-                            seller_name = seller_elem.get_text().strip()
-                            # Clean up seller name
+                    # Extract seller name with multiple approaches
+                    seller_name_found = False
+                    
+                    # Look for seller profile links
+                    seller_links = container.find_all('a', href=re.compile(r'seller='))
+                    for link in seller_links:
+                        seller_name = link.get_text().strip()
+                        if seller_name and seller_name.lower() not in ['amazon', 'amazon.com']:
                             seller_name = re.sub(r'^(by\s+)', '', seller_name, flags=re.IGNORECASE)
                             seller_data['seller_name'] = seller_name
+                            seller_name_found = True
                             break
                     
-                    # Extract condition
-                    condition_elem = container.find('span', class_='a-size-base') or \
-                                    container.find('span', string=re.compile(r'New|Used|Refurbished|Collectible', re.I))
+                    # Fallback: look for seller mentions in text
+                    if not seller_name_found:
+                        seller_patterns = [
+                            r'Sold by\s+([^.\n]+?)(?:\s|$)',
+                            r'Ships from and sold by\s+([^.\n]+?)(?:\s|$)',
+                            r'by\s+([^.\n]+?)(?:\s|$)'
+                        ]
+                        
+                        for pattern in seller_patterns:
+                            match = re.search(pattern, container_text, re.IGNORECASE)
+                            if match:
+                                seller_name = match.group(1).strip()
+                                if seller_name and len(seller_name) > 2:
+                                    seller_data['seller_name'] = seller_name
+                                    seller_name_found = True
+                                    break
                     
-                    if condition_elem:
-                        condition_text = condition_elem.get_text().strip()
-                        # Extract just the condition part
-                        for cond in ['New', 'Used', 'Refurbished', 'Collectible']:
-                            if cond.lower() in condition_text.lower():
-                                seller_data['condition'] = cond
-                                break
+                    # Extract condition
+                    condition_keywords = ['New', 'Used', 'Refurbished', 'Collectible', 'Renewed']
+                    for keyword in condition_keywords:
+                        if keyword.lower() in container_text.lower():
+                            seller_data['condition'] = keyword
+                            break
                     
                     # Extract shipping information
-                    shipping_elem = container.find('span', string=re.compile(r'shipping|delivery|FREE', re.I))
-                    if shipping_elem:
-                        seller_data['shipping'] = shipping_elem.get_text().strip()
+                    shipping_patterns = [
+                        r'(\$\d+\.\d{2}\s+shipping)',
+                        r'(FREE\s+(?:Shipping|delivery))',
+                        r'(\+\s*\$\d+\.\d{2}\s+shipping)',
+                        r'(Prime\s+FREE\s+Delivery)'
+                    ]
                     
-                    # Ships from / Sold by information
-                    fulfillment_text = container.get_text()
+                    for pattern in shipping_patterns:
+                        match = re.search(pattern, container_text, re.IGNORECASE)
+                        if match:
+                            seller_data['shipping'] = match.group(1).strip()
+                            break
                     
+                    # Extract fulfillment info
                     # Ships from
-                    ships_match = re.search(r'Ships from\s+([^.\n]+)', fulfillment_text, re.IGNORECASE)
+                    ships_match = re.search(r'Ships from\s+([^.\n]+)', container_text, re.IGNORECASE)
                     if ships_match:
                         seller_data['ships_from'] = ships_match.group(1).strip()
                     
-                    # Sold by
-                    sold_match = re.search(r'Sold by\s+([^.\n]+)', fulfillment_text, re.IGNORECASE)
+                    # Sold by (different from seller_name, this is fulfillment info)
+                    sold_match = re.search(r'Sold by\s+([^.\n]+)', container_text, re.IGNORECASE)
                     if sold_match:
                         seller_data['sold_by'] = sold_match.group(1).strip()
                     
-                    # Only add if we found meaningful data
+                    # Only add seller if we found meaningful data (price OR seller name)
                     if seller_data.get('price') or seller_data.get('seller_name'):
                         sellers_data.append(seller_data)
-                        st.success(f"Extracted seller {i+1}: {seller_data.get('seller_name', 'Unknown')} - ${seller_data.get('price', 'N/A')}")
+                        st.success(f"✓ Seller {len(sellers_data)}: {seller_data.get('seller_name', 'Unknown')} - ${seller_data.get('price', 'N/A')} - {seller_data.get('condition', 'N/A')}")
+                    
+                st.info(f"Successfully extracted {len(sellers_data)} sellers total")
                 
         except Exception as e:
-            st.warning(f"Could not fetch additional seller data for {asin}: {str(e)}")
+            st.error(f"Error fetching additional seller data for {asin}: {str(e)}")
+            import traceback
+            st.error(f"Traceback: {traceback.format_exc()}")
         
         return sellers_data
     
